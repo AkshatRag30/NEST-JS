@@ -1,0 +1,18 @@
+# JWT with NestJS — Study Guide
+
+This folder holds a small set of notes for a repo that is, in an important sense, mostly empty. The project is named `jwt-app` and its whole reason for existing is a single slide deck, `slides/JWT Tokens & Authentication Vs Authorization.pdf`. That deck is eight slides long and covers three things: what authentication means, what authorization means, and what a JWT is along with the basic shape of a login flow that uses one. Every one of those ideas is genuinely useful to understand, and these notes explain all of them in real depth. But you should know going in that none of it has been turned into working code anywhere in this repository. The `src` folder here is the plain, untouched output of running the Nest CLI's `new` command, nothing more.
+
+You are a beginner in backend development, so these notes assume no prior experience and explain things from first principles. Where an idea comes straight from the slide deck, that is said explicitly, usually with a close paraphrase or a short quote of the actual slide text. Where a note goes further than the slides do, filling in detail a beginner would need but the deck itself does not spell out, that is also said explicitly, so you always know which parts are "this is literally what the course slides say" and which parts are "this is standard JWT knowledge added to make the slide bullet actually usable."
+
+## How to read these notes
+
+Go in order. The first note explains what is and is not actually in this codebase, so you do not spend time hunting for JWT code that was never written. The second and third notes cover the two conceptual halves of the slide deck. The fourth note sketches, purely as an illustration, what turning this scaffold into a real JWT protected API would involve.
+
+1. [01-project-setup-and-what-is-actually-here.md](01-project-setup-and-what-is-actually-here.md) — a full walkthrough of every file in this repo, `package.json`, `main.ts`, the default controller and service, the config files, and a direct, verified statement of what is missing.
+2. [02-jwt-structure-and-how-it-works.md](02-jwt-structure-and-how-it-works.md) — what a JSON Web Token actually is, its three part header, payload, and signature structure, how signing and verification work, and the login flow the slides describe.
+3. [03-authentication-vs-authorization.md](03-authentication-vs-authorization.md) — the specific distinction the slides draw between authentication and authorization, with their own Gmail examples, and how the two ideas relate to a JWT once one exists.
+4. [04-what-a-real-implementation-would-look-like.md](04-what-a-real-implementation-would-look-like.md) — an illustrative sketch, clearly marked as not present in this repo, of what adding `@nestjs/jwt` and `passport-jwt` to this exact scaffold would take.
+
+## A note on the source material, and where to look next
+
+The slide deck in this repo is short and high level, closer to a set of definitions and a single flow diagram in bullet form than a tutorial. There is no accompanying code walkthrough anywhere in this project, which is why `src` never grew past what `nest new` generates by default. If you want to see these exact concepts, authentication, authorization, and JWTs, turned into real, running NestJS code, a sibling project in this same parent folder, `JWT-Auth-with-Mongo-DB-Nest-JS-main`, is where that actually happens: a real auth module, a JWT strategy, a user schema backed by MongoDB, and real login and protected routes. These notes do not read or analyze that project, they only point you to it as the natural next stop once you have the concepts from this one straight.
