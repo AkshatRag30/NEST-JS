@@ -8,7 +8,9 @@ This exists to answer one question, how do you actually understand a large, real
 
 ## How to read this folder
 
-Read the six root level files first, in order, they are the architectural spine every feature module in this app is built on top of.
+If you want a real, paced study plan instead of just a table of contents, read [09-how-to-study-this-as-a-beginner.md](09-how-to-study-this-as-a-beginner.md) first, it turns everything below into a session by session plan with a prerequisite check and concrete things to actually do, not just read.
+
+Otherwise, read the six root level files first, in order, they are the architectural spine every feature module in this app is built on top of.
 
 1. [01-what-is-this-product.md](01-what-is-this-product.md), what this business actually is and how to tell, from the evidence in the code, without being told.
 2. [02-high-level-architecture-and-bootstrap.md](02-high-level-architecture-and-bootstrap.md), `main.ts` and `app.module.ts`, read closely, and what almost ninety imported feature modules actually looks like in practice.
