@@ -1,0 +1,35 @@
+# Cluster 06: Chain and Registrar Integrations
+
+## What lives in this cluster
+
+This cluster is the part of Endless Domains that talks to the outside world of blockchains and domain registrars. Roughly seventeen folders sit under `src/components`, and each one is meant to be the company's bridge to one external chain or one external company that also sells or resolves domain names. The full list this note covers is `ud-integration`, `freename` (with its `auth` and `domain` and `search` sub modules), `custom-domain`, `eth-domain-renewal`, `bnb-arb-domain-renewal`, `recentdomains`, `ens-integration`, `ens-arb-bnb-domain-suggestion`, `starknet-integration`, `box-integration`, `bonfida`, `avax-integration`, `aptos-integration`, `ton-intigration` (yes, spelled that way in the real repo, a typo nobody ever fixed), `tezos-integration`, `arb-integration`, `fetch-domains`, and `bnb-integration`.
+
+The single most useful fact about this cluster, and the reason it is worth reading as a set rather than folder by folder, is that most of these are not really seventeen different designs. They are one design, repeated. A frontend developer moving into fullstack work runs into this constantly in real codebases: once you learn the shape of one integration module, you can often predict the other twelve before you open them. That is genuinely a skill worth practicing here, and this cluster is a clean place to practice it, because the shape really is that consistent across most of the smaller folders, and the handful of exceptions are exactly the places worth slowing down.
+
+## The shared shape, in one paragraph
+
+Take away the ten or eleven folders that are genuinely small (five or six files each: `starknet-integration`, `box-integration`, `bonfida`, `avax-integration`, `aptos-integration`, `ton-intigration`, `tezos-integration`, `arb-integration`, `bnb-integration`, `ens-arb-bnb-domain-suggestion`) and you will find the same four pieces every time. A NestJS module that wires one service behind a string token interface (`'StarknetIntegrationServiceInterface'` and so on). A service with one real public method, almost always some spelling of `checkAvailability`, that reads a base URL and sometimes a token out of `ConfigService`, builds a request (a plain GET, a JSON RPC POST, or a GraphQL POST body baked as a template string), sends it through the shared `httpClient` wrapper, and maps the raw response into a small DTO. A DTO file that is a flat class with no logic, just fields. And a catch block that logs the failure and returns something safe (an empty array, `null`, `undefined`, or the literal string `'error'`) rather than ever throwing back to the caller. File [03-the-shared-checkavailability-pattern.md](03-the-shared-checkavailability-pattern.md) walks through one of these in full and then tables out how the rest differ.
+
+Two folders are big enough to break that shape entirely and are worth their own deep read: `ud-integration` at forty four files and `freename` at thirty five. Both are covered on their own, because both are doing far more than checking availability, and both show what these integrations grow into once a registrar relationship becomes a real, ongoing part of the business rather than a one method availability check.
+
+A third group does not check availability at all, it writes to a blockchain directly, either on behalf of the company's own wallet (`ens-integration`) or by preparing a transaction for a user's own wallet to sign and later verifying it landed (`eth-domain-renewal`, `bnb-arb-domain-renewal`). These three are covered together, because the contrast between "the company signs" and "the user signs" is the most interesting architectural decision in the whole cluster, and it only becomes visible once you read both.
+
+A fourth group, `custom-domain`, `recentdomains`, and `fetch-domains`, was flagged as worth checking rather than assumed to fit, and after reading every file in each, none of the three is really an external integration at all. What they actually are, and why they ended up sitting in this part of the codebase anyway, is its own short note.
+
+## The files in this note
+
+[01-ud-integration-the-swiss-army-knife.md](01-ud-integration-the-swiss-army-knife.md) is the deep read on `ud-integration`, Unstoppable Domains' own registrar API plus, unexpectedly, a manual lookup path into six other chains that has nothing to do with Unstoppable Domains at all.
+
+[02-freename-three-modules-one-registrar.md](02-freename-three-modules-one-registrar.md) is the deep read on `freename`, a second registrar the company resells, split into an `auth` module that manages its own OAuth style tokens, a `domain` module that runs the actual register and mint lifecycle, and a `search` module that duplicates a chunk of the `auth` and `domain` modules' own logic to do a plain availability check.
+
+[03-the-shared-checkavailability-pattern.md](03-the-shared-checkavailability-pattern.md) is the pattern and comparison table for the ten small, single purpose chain folders, plus the one clear case of a broken, duplicated version of that pattern hiding inside `arb-integration`.
+
+[04-onchain-write-and-renewal-flows.md](04-onchain-write-and-renewal-flows.md) covers `ens-integration`, `eth-domain-renewal`, and `bnb-arb-domain-renewal`, the three modules that skip the "call someone else's API" pattern completely and talk straight to a blockchain node, and contrasts the custodial way the company registers a fresh `.eth` name against the far more careful, user signed way it lets someone renew one.
+
+[05-not-actually-integrations.md](05-not-actually-integrations.md) covers `custom-domain`, `recentdomains`, and `fetch-domains`, three folders that live in this part of the codebase but turn out, on a full read, to be a curated Postgres catalog, a homepage activity ticker, and an internal event handler, none of which is really "integrating with a registrar" in the sense the rest of this cluster is.
+
+[06-quirks-and-bugs-catalog.md](06-quirks-and-bugs-catalog.md) collects the smaller, specific things that only show up once you actually read every file rather than trust the folder names: a provider token misspelled as `Bondifa` instead of `Bonfida`, a GraphQL query copy pasted into a REST only integration that never uses it, two DTO files that exist but are completely empty, a duplicated enum inside `freename` with two different sets of values under the same name, and the one genuinely dead, unreachable method sitting inside `arb-integration`.
+
+## The one line summary worth remembering
+
+Most of this cluster is the same four piece pattern repeated with a different base URL and a different response shape bolted on. The two big folders and the write flow folders are where that pattern breaks down on purpose, because the business relationship behind them grew past a simple availability check, and the three folders that do not fit at all are proof that a directory name is a hint about what code does, never a guarantee.
