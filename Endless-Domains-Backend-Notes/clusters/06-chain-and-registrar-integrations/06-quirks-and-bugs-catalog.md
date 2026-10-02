@@ -33,3 +33,39 @@ Covered in [05-not-actually-integrations.md](05-not-actually-integrations.md). `
 ## A naming trap between two similarly named folders
 
 Not a bug, but worth repeating here because it is easy to trip over: `ens-integration` and `ens-arb-bnb-domain-suggestion` are not variations on the same feature despite the overlapping name. One is a full custodial commit and reveal registration flow that signs real transactions with the company's own wallet; the other is a small, read only GraphQL availability and suggestion lookup shared across ENS, Arbitrum, and BNB. Assuming they are close cousins because of the shared `ens` prefix is exactly the kind of folder name assumption this whole cluster turned out to reward checking rather than trusting.
+
+## Update from the October 2026 uat pull
+
+Every entry above is still accurate after the October 2026 pull, including the hardcoded Infura key, which commit `71fd2fec` touched (it changed `ethers.providers.JsonRpcProvider` to `ethers.JsonRpcProvider` on that very line, `recent-domain.service.ts` line 54) without moving the key into config. The ethers v5 to v6 upgrade in commits `71fd2fec` and `26b1f0e4`, plus a few unrelated fixes, add the following entries to this catalog. Each one is explained in depth in the note named in brackets.
+
+### ENS quote generation passed a meaningless argument to `createRandom`
+
+`ens-integration/ens-integration.service.ts` line 227 used to call `ethers.Wallet.createRandom(['i'])`. The array was never a valid argument, v5 silently ignored it and v6 rejects it at compile time, so commit `26b1f0e4` removed it. This one is now fixed, and listed here so that anyone reading the old code in git history understands the change ([04-onchain-write-and-renewal-flows.md](04-onchain-write-and-renewal-flows.md)).
+
+### A `bigint` chain id quietly broke the UD ticker, and was fixed
+
+In ethers v6 `network.chainId` is a `bigint`, so the old `network.chainId === 137` in `recentdomains/recent-domain.service.ts` `testUdNetwork` would always have been `false`, because `137n === 137` is `false`. Line 153 now reads `Number(network.chainId) === 137`. Fixed, and pinned by two new tests in `recent-domain.service.spec.ts` ([05-not-actually-integrations.md](05-not-actually-integrations.md)).
+
+### `getRecentBnbDomains` can return `undefined` and sink the whole homepage ticker
+
+Still open. `recentdomains/recent-domain.service.ts` lines 246 to 313 retry three times and then fall off the end of the function without a `return`, so the caller gets `undefined`. `seedAllRecentDomains` only guards against thrown errors, so `bnbDomains.slice(0, 3)` at line 465 throws and the whole refresh of `tbl_recent_domain` fails even when the other four sources succeeded ([05-not-actually-integrations.md](05-not-actually-integrations.md)).
+
+### UD log decoding assumes every log decoded
+
+Still open. `queryFilter` in v6 returns `EventLog | Log`, and only `EventLog` has `.args`, so `log.args.uri` at `recent-domain.service.ts` line 422 throws on any log the ABI could not decode, failing the whole UD feed rather than skipping that log ([05-not-actually-integrations.md](05-not-actually-integrations.md)).
+
+### Provider objects without `staticNetwork`
+
+Still open, and new with v6. The older integrations in this cluster build `new ethers.JsonRpcProvider(url)` without a chain id or `{ staticNetwork: true }` (four providers in `recent-domain.service.ts` lines 53 to 57). In v6 an unreachable URL makes such a provider retry network detection once a second indefinitely, logging each time, which the newer marketplace v2 code explicitly guards against at `src/components/marketplacev2/order/order.service.ts` lines 154 to 159 ([../05-blockchain-infrastructure/02-web3js-and-ethersjs-two-libraries-one-job.md](../05-blockchain-infrastructure/02-web3js-and-ethersjs-two-libraries-one-job.md)).
+
+### Two renewal verifiers compare hashes case sensitively across two libraries
+
+Still open, latent rather than live. `eth-domain-renewal/services/eth-domain-renewal-verification.service.ts` lines 38 to 39 and `bnb-arb-domain-renewal/services/bnb-arb-domain-renewal-verification.service.ts` lines 41 to 42 compare a web3.js `keccak256` of the on chain input against an ethers v6 `keccak256` stored at prepare time using a plain `!==`. Both libraries emit lowercase hex today, so it works, but nothing tests that agreement ([04-onchain-write-and-renewal-flows.md](04-onchain-write-and-renewal-flows.md)).
+
+### The BNB expiry lookup can overwrite a good value with `"0"`
+
+Still open, new in commit `546e26e9`. `alchmey/bnb-alchmey/bnb-alchmey.serveice.ts` line 237 returns `result || null` from the registrar's `nameExpires`, and the string `"0"` is truthy, so a label the configured registrar does not know replaces the indexer's real expiry with 1 January 1970 ([../05-blockchain-infrastructure/06-alchemy-and-the-alchmey-folder.md](../05-blockchain-infrastructure/06-alchemy-and-the-alchmey-folder.md)).
+
+### Undeclared v5 helper packages
+
+Still open. `@ethersproject/bignumber` (imported at `alchmey/arbAlchmey/arb-alchmey.servers.ts` line 11) and `@ethersproject/bytes` (imported at `alchmey/fetch-expiry/fetch-expiry.service.ts` line 11 and `ud-integration/ud-integration.service.ts` line 27) are not in `package.json`. They used to arrive with `ethers@5`, and since the upgrade they only arrive because `alchemy-sdk` depends on them. The codebase wide picture is in [../12-marketplace-v2/12-ethers-v6-migration-and-the-new-test-suite.md](../12-marketplace-v2/12-ethers-v6-migration-and-the-new-test-suite.md).

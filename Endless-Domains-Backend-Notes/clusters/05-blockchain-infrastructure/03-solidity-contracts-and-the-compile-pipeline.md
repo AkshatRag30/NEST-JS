@@ -61,10 +61,11 @@ The comment explaining why this second script exists at all, rather than just pa
 `verify-nft-template.js` is the most interesting of the five, because it does not touch a real blockchain at all, it spins up an entirely local, in memory fake one using the `ganache` package, and runs the exact same deployment path the real service will run against it:
 
 ```js
-const provider = new ethers.providers.Web3Provider(ganache.provider({ logging: { quiet: true } }));
-const signer = provider.getSigner(0);
+// src/scripts/verify-nft-template.js (lines 16 to 28, ethers v6 form since commit 2c7fca78)
+const provider = new ethers.BrowserProvider(ganache.provider({ logging: { quiet: true } }));
+const signer = await provider.getSigner(0);
 ...
-const iface = new ethers.utils.Interface(artifact.abi.filter((f) => f.type === 'constructor'));
+const iface = new ethers.Interface(artifact.abi.filter((f) => f.type === 'constructor'));
 const encodedArgs = iface.encodeDeploy(['Test Collection', 'TEST', 'ipfs://fake-metadata-hash', ownerAddress]);
 const data = artifact.bytecode + encodedArgs.slice(2);
 
@@ -81,3 +82,15 @@ Put together, the flow for either contract is always the same four steps, edit t
 ## Where to go next
 
 [04-contract-deployment-and-nft-collection-prepare-confirm-pattern.md](04-contract-deployment-and-nft-collection-prepare-confirm-pattern.md) picks up exactly where this leaves off, showing how those bytecode constants get combined with a specific user's chosen name, symbol, and supply into a real, unsigned deployment transaction.
+
+## Update from the October 2026 uat pull
+
+`src/scripts/verify-nft-template.js` was rewritten for ethers v6 in commit `2c7fca78` ("Completed the B03 sprint and tested the apis", 16 September 2026), and the excerpt above has been corrected in place. Only three lines changed, and each one teaches a real v5 to v6 difference.
+
+Line 16 swapped `new ethers.providers.Web3Provider(...)` for `new ethers.BrowserProvider(...)`. In v5, `Web3Provider` was the class you used to wrap anything that spoke the EIP 1193 interface, which is the `request({ method, params })` shape that MetaMask injects as `window.ethereum` and that `ganache.provider()` also implements. v6 renamed that class to `BrowserProvider`. The name is a little misleading here, because nothing about this script runs in a browser, but the class does not care, it just needs an object with a `request` method.
+
+Line 17 changed `provider.getSigner(0)` to `await provider.getSigner(0)`. In v5 `getSigner` returned a signer synchronously and resolved the account lazily. In v6 it is an `async` method that returns a `Promise<JsonRpcSigner>`, because it actually asks the node for its account list first. Forgetting the `await` is one of the most common v6 migration bugs: the next line, `signer.getAddress()`, would fail with "signer.getAddress is not a function" because `signer` would still be a Promise.
+
+Line 21 swapped `new ethers.utils.Interface(...)` for `new ethers.Interface(...)`, the same namespace flattening covered in [02-web3js-and-ethersjs-two-libraries-one-job.md](02-web3js-and-ethersjs-two-libraries-one-job.md).
+
+The rest of the script already happened to be v6 compatible. `receipt.status !== 1` at line 30 still works because `status` is a plain number in v6, `receipt.gasUsed.toString()` at line 38 works because `gasUsed` is now a `bigint` and `bigint` also has `toString()`, and `contract.safeMint(ownerAddress, 1)` at line 49 accepts a plain number for a `uint256` argument in both versions. The script is still not part of the Jest suite (its own comment at lines 4 to 6 says so), so nothing runs it automatically, you have to run `node src/scripts/verify-nft-template.js` by hand. Note also that the two generator scripts, `write-erc20-template-constant.js` and `write-nft-template-constant.js`, still write the v5 phrase "`ethers.utils.Interface.encodeDeploy`" into the doc comment of the constant files at line 16, a harmless but stale leftover. The codebase wide migration story is in [../12-marketplace-v2/12-ethers-v6-migration-and-the-new-test-suite.md](../12-marketplace-v2/12-ethers-v6-migration-and-the-new-test-suite.md).

@@ -101,3 +101,47 @@ Without this normalization, a user could accidentally, or deliberately, register
 `node20-crypto-primitives.spec.ts` and `node20-auth-hash-primitives.spec.ts` are not testing anything specific to this application's own business logic, they are testing that the Node.js runtime itself, on version 20, still correctly provides the low level cryptographic primitives this app depends on everywhere else. The first confirms `crypto.randomUUID()`, `crypto.randomBytes(32)`, and the newer Web Crypto API's `crypto.subtle.digest('SHA-256', ...)` all behave as expected. The second confirms `argon2.hash`/`argon2.verify` and `bcrypt.hash`/`bcrypt.compare`, both native addon backed password hashing libraries, still round trip correctly, a hash created by one call can be verified as correct by the other and correctly rejected against the wrong password.
 
 Both are best understood as regression tests written specifically around a Node.js version upgrade, argon2 and bcrypt both rely on compiled native addons that are sensitive to exactly which Node version and platform they were built against, and a runtime upgrade is one of the more common ways a password hashing library can silently start failing in production. Having an explicit, fast test suite that just answers "do these fundamental primitives still work at all under this Node version" is a genuinely good practice before trusting a version bump anywhere near authentication code, and it is a good example of tests functioning as living documentation of what a low level dependency is actually expected to do, exactly the reason this cluster's brief singled these two files out as worth reading even though they are test files.
+
+## Update from the October 2026 uat pull
+
+Two shared utilities grew in this pull, and one logging behaviour changed. `retryWithBackoff` and `httpClient` themselves are byte for byte unchanged since the baseline commit, so the excerpts above are still accurate.
+
+### A second retry predicate, written for blockchain RPC errors
+
+Commit `546e26e9` ("Implemented new poller system", 21 September 2026) added a new file next to `retryWithBackoff`, and its doc comment explains the gap it fills better than any paraphrase:
+
+```ts
+// src/@core/utils/retry/is-retryable-chain-error.util.ts (whole file, lines 1 to 18)
+/**
+ * Covers timeouts/ECONNRESET/5xx - retryWithBackoff's own default only
+ * covers 429/RESOURCE_EXHAUSTED (quota errors), which is the wrong shape for
+ * an RPC node that's merely slow or briefly down. Originally written for
+ * B-03's chain checks (order.service.ts); extracted here so B-04's poller
+ * tick loop uses the exact same predicate rather than a second, possibly
+ * drifting copy.
+ */
+export function isRetryableChainError(error: unknown): boolean {
+    const err = error as { code?: unknown; status?: unknown; response?: { status?: unknown } } | null | undefined;
+    if (!err) return false;
+    const code = typeof err.code === 'string' ? err.code : undefined;
+    if (code && ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND', 'TIMEOUT', 'NETWORK_ERROR', 'SERVER_ERROR'].includes(code)) {
+        return true;
+    }
+    const status = typeof err.status === 'number' ? err.status : typeof err.response?.status === 'number' ? err.response.status : undefined;
+    return typeof status === 'number' && status >= 500 && status < 600;
+}
+```
+
+Read the `code` list carefully, because it mixes two vocabularies on purpose. `ECONNRESET`, `ETIMEDOUT`, `ECONNREFUSED` and `ENOTFOUND` are Node.js socket error codes, the kind of thing you get when a TCP connection is dropped, times out, is refused, or the hostname does not resolve. `TIMEOUT`, `NETWORK_ERROR` and `SERVER_ERROR` are ethers v6 error codes: ethers wraps failures in its own error objects with a string `code`, and these three are what it uses for a request that timed out, a network level failure, and a node that answered with an HTTP error or a malformed response. The last line then also retries any HTTP 5xx status found either directly on the error or on an axios style `error.response.status`. Notice the defensive typing: the function takes `unknown` and narrows every field with `typeof` before using it, which is the right way to write a predicate that will be handed arbitrary thrown values.
+
+It is used by passing it as the `isRetryable` option, for example `retryWithBackoff(() => this.provider.getBlockNumber(), { isRetryable: isRetryableChainError })` at `src/components/marketplacev2/poller/tick/chain-event-source-poller.service.ts` line 203, and today every one of its callers lives in marketplace v2 (`order.service.ts` lines 328, 357 and 388, the two poller application services, and the poller tick), covered in [../12-marketplace-v2/08-the-onchain-event-poller-architecture.md](../12-marketplace-v2/08-the-onchain-event-poller-architecture.md). That also updates the adoption point made above: `retryWithBackoff` is now imported by seven non test files, two of them older (`ga4.service.ts`, `gsc.service.ts`) and five of them new marketplace v2 files.
+
+Three honest observations. First, passing a custom `isRetryable` replaces the default rather than adding to it (`retry-with-backoff.util.ts` line 10 destructures `isRetryable = DEFAULT_IS_RETRYABLE`, so the default only applies when no predicate is given). A 429 is not in the 500 to 599 range and `429` is not a string code, so chain calls made with this predicate are no longer retried when a public RPC provider rate limits them, which on Polygon public endpoints is one of the most common failures of all. Combining both, `(e) => isRetryableChainError(e) || DEFAULT_IS_RETRYABLE(e)`, would cover it, but `DEFAULT_IS_RETRYABLE` is not exported today. Second, axios reports its own timeout as `ECONNABORTED` (unless the `transitional.clarifyTimeoutError` option is set), which is not in the list, so the "covers timeouts" claim is true for ethers and raw sockets but not for an `httpClient` timeout, a distinction that only matters if someone reuses this predicate for HTTP calls. Third, there is no spec file for this predicate, the only spec in that folder is the older `retry-with-backoff.util.spec.ts`.
+
+### `EXTENDED_HTTP_TIMEOUT_MS` gets its first real user
+
+`http-client.util.ts` already exported `EXTENDED_HTTP_TIMEOUT_MS = 45000` (line 19) for slow write calls. Commit `96f221ec` made the Freename `zones/self` listing call pass `{ headers, timeout: EXTENDED_HTTP_TIMEOUT_MS }` (`src/components/alchmey/freename-alchmey/freename-alchmey.serveice.ts` line 123), because an 8 second timeout there used to wipe a user's Freename domains on refresh. That is a nice real example of the per call override this section describes, and the story is in [../04-domain-core-product/06-domain-detail-refresh-and-rate-limiting.md](../04-domain-core-product/06-domain-detail-refresh-and-rate-limiting.md).
+
+### `CustomLoggerService.warn` now writes to the console
+
+This is the shared logger rather than a util, but every service uses it. `src/logger/file-logge.ts` line 87 now adds `console.log(new Date().toISOString(), this.context, message, 'warn')` to `warn()`, matching what `log()` (line 76) and `error()` (line 82) already did. The history behind that one line is instructive. Commit `96f221ec` first added a third CloudWatch transport with `level: 'warn'`, because, as its comment said, the error transport only accepts `error` and the info transport is filtered to exactly `info`, so every `warn()` call in the whole application, including the new poller's notices, "was written nowhere". The very next day, commit `bdd8e80a` removed that transport again and kept only the console line. So the net result on `uat` is that `warn()` messages appear in the process output (and therefore in whatever PM2 or the container runtime collects from stdout), but they are still not shipped to either CloudWatch log group by winston. If you are looking for a warning in CloudWatch and cannot find it, that is why. One more thing worth verifying while you are in that file: `filterOnlyLevel` at line 29 is declared `async`, so it returns a `Promise` wrapping the format rather than a winston format object, and it is that Promise that is passed as `format` to the info transport at line 66. The general logging design is covered at the root level of these notes.

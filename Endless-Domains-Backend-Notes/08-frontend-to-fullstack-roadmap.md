@@ -20,4 +20,16 @@ Do not try to contribute to this exact codebase as your first step unless your j
 
 ## The honest, final test
 
-You are ready to call yourself meaningfully progressed toward fullstack, not finished, nobody is ever finished, when you can pick any single feature folder in this real codebase you have not yet had summarized for you, open it cold, and produce your own short version of what one of these eleven cluster notes did, in your own words, checked against the real code, before reading whatever an AI or a teammate has already written about it. That is the actual skill every note in this entire folder was quietly modeling for you the whole time.
+You are ready to call yourself meaningfully progressed toward fullstack, not finished, nobody is ever finished, when you can pick any single feature folder in this real codebase you have not yet had summarized for you, open it cold, and produce your own short version of what one of these twelve cluster notes did, in your own words, checked against the real code, before reading whatever an AI or a teammate has already written about it. That is the actual skill every note in this entire folder was quietly modeling for you the whole time.
+
+## Update from the October 2026 uat pull
+
+The new [cluster 12](clusters/12-marketplace-v2/00-README.md) gives you three better exercises than anything the older code offered, because for the first time the patterns are mostly built well, with tests, so you can copy their good parts and avoid their documented mistakes.
+
+The first is a validated config loader. In your own project, replace any scattered `process.env.SOMETHING` reads with one loader that reads every key once, validates each with a small function that names the bad key in its error, and hands the rest of the app a typed object, the way `src/components/marketplacev2/config/chain-config.loader.ts` does. Then add the thing this codebase forgot: a test that fails if your `.env.sample` lists a key name the loader does not read.
+
+The second is cursor pagination. Add a cursor based list endpoint, modelled on `order/util/order-cursor.util.ts`, with a stable tie breaker (sort by the value, then by id). Then deliberately fix the two problems note 06 found: reject a cursor whose sort key does not match the requested sort with a 400, and store your timestamps as `timestamptz`. Build the React infinite scroll that consumes it.
+
+The third is a small background worker that is safe to run twice. Write a job that processes rows in order and keeps a cursor, then start two copies of your app at once and watch it break. Fix it with a Postgres advisory lock or a conditional `UPDATE ... WHERE last = :expected`, and write a test for the case where two copies run together. That one exercise teaches more about real backend work than almost anything else in this folder, and it is the exact problem [clusters/12-marketplace-v2/08-the-onchain-event-poller-architecture.md](clusters/12-marketplace-v2/08-the-onchain-event-poller-architecture.md) describes.
+
+One more habit this update rewards: open a feature's `.spec.ts` before its implementation. Marketplace v2's test titles are often the clearest statement of intent in the code, and checking whether each test really asserts what its title claims (several do not, see the update section of [07-security-and-quality-findings-index.md](07-security-and-quality-findings-index.md)) is good practice for reviewing other people's pull requests.

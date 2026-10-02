@@ -56,7 +56,7 @@ This is the single most expensive read triggered anywhere in this module. One ca
 
 ## What happens once the data comes back
 
-Once every provider has answered, `bulkUpdateDomainDetailBlockChain` upserts the fetched NFTs into `tbl_domain_detail_bc`, replacing that user's stored snapshot with what their wallets genuinely hold right now. Immediately after that succeeds, an internal event is emitted:
+Once every provider has answered, `bulkUpdateDomainDetailBlockChain` (`src/components/domain/domain-detail/domain-detail-bc.repo.ts` lines 121 to 145) writes the fetched NFTs into `tbl_domain_detail_bc`, replacing that user's stored snapshot with what their wallets genuinely hold right now. Strictly speaking it is not an upsert: inside one database transaction it hard deletes every row for that `userId` and then inserts the new batch with `.orIgnore()` (Postgres `ON CONFLICT DO NOTHING`), so whatever the providers did not report is gone after a refresh, which matters a great deal in the update section below. Immediately after that succeeds, an internal event is emitted:
 
 ```ts
 this.eventEmitter.emit('domain.sync.completed', new DomainSyncCompletedEvent(userId, data));
@@ -67,3 +67,22 @@ This is not a dead end, it is the entry point into the domain tenure system cove
 ## Other things this controller exposes
 
 The rest of `DomainDetailController` is a smaller supporting cast around this same underlying data, `available-tlds` returns the distinct set of TLDs a given user actually owns something in, `user-analytic` powers a dashboard of a user's own portfolio broken down by TLD, blockchain, EVM versus non EVM, expired versus not, and listed on the marketplace versus not, `user-nfts/:walletAddress` is a thin passthrough to `UdAlchemyService.getAllNftsForAddress` for a raw NFT lookup by wallet, and `user/user-stats/:userId` is an admin facing summary, total domains, how many are expiring soon, how many are already expired, how many are listed for resale, and how many are not configured yet, computed with straightforward SQL aggregation and date math against `tbl_domain_detail_bc` rather than another live blockchain call, which is exactly why that one, unlike the refresh route, needs no special protection.
+
+## Update from the October 2026 uat pull
+
+The controller and `refreshDomainDetailData` excerpts above are unchanged, but three things changed underneath the refresh route in this pull, and one of them fixes a nasty data loss bug that this note should have been able to warn you about.
+
+First, the rate limiter list in `src/main.ts` grew a third entry in commit `96f221ec` ("fixed the reported bugs", 30 September 2026). Lines 83 to 85 now read:
+
+```ts
+// src/main.ts (lines 83 to 85)
+app.use('/api/v1/auth/forgot-password', apiCallLimiter);
+app.use('/api/v1/domain/detail/refresh_domain', apiCallLimiter);
+app.use('/api/v1/marketplacev2/orders/listing-status/sync', apiCallLimiter);
+```
+
+The new route belongs to marketplace v2 (see [../12-marketplace-v2/01-what-marketplace-v2-is-and-the-module-map.md](../12-marketplace-v2/01-what-marketplace-v2-is-and-the-module-map.md)). It shares the same `apiCallLimiter` instance, which is worth understanding: `express-rate-limit` keys its counter by client IP by default, and one limiter object has one counter store, so a single IP's calls to all three routes are counted together against the same `API_CALL_LIMIT`. A user who refreshes their domains a few times and then syncs a listing status can find the second action rate limited because of the first.
+
+Second, the Freename leg of the refresh (line 37 of the excerpt) now gets a 45 second timeout instead of the shared 8 second default, in `src/components/alchmey/freename-alchmey/freename-alchmey.serveice.ts` line 123. The commit's own comment explains why that was urgent: when Freename's paginated `zones/self` call timed out, the refresh carried on with an empty Freename result, and `bulkUpdateDomainDetailBlockChain` at line 49, which deletes the user's existing rows before inserting the fresh batch, then erased every Freename domain the user had on file. So replacing the stored snapshot, as described above (a hard delete of every row for the user followed by an insert, inside one transaction), has a sharp edge: it replaces it with what the providers successfully reported, and a provider failure that is swallowed somewhere upstream looks identical to "the user owns nothing on that chain". The longer timeout makes the Freename case rarer but does not change that underlying design, the same risk exists for any of the six providers whose failure is converted into an empty array instead of an error. Details in [../05-blockchain-infrastructure/06-alchemy-and-the-alchmey-folder.md](../05-blockchain-infrastructure/06-alchemy-and-the-alchmey-folder.md).
+
+Third, the BNB leg (line 39 of the excerpt) is now slower per domain. Commit `546e26e9` made `BnbAlchmeyService.getDomainExpiry` read the expiry directly from the SPACE ID base registrar with web3.js before falling back to the indexer, which adds one database lookup and one BNB RPC call per BNB domain, run sequentially inside a `for` loop. That makes this already expensive route a little more expensive, and is one more reason the dedicated limiter above is worth keeping. The new code also has a `"0"` expiry edge case covered in the same alchemy note. None of the other providers in the excerpt changed in this pull apart from the general ethers v6 migration, described in [../12-marketplace-v2/12-ethers-v6-migration-and-the-new-test-suite.md](../12-marketplace-v2/12-ethers-v6-migration-and-the-new-test-suite.md).

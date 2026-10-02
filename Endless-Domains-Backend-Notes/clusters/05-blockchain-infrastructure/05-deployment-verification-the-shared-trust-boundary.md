@@ -15,8 +15,9 @@ Everything in file 04 ends by handing this one function four pieces of informati
 Step one resolves the chain and its RPC endpoint from AWS Secrets Manager, and step two actually fetches the transaction from that chain:
 
 ```ts
+// src/components/blockchain-deployment/services/deployment-verification.service.ts (lines 70 to 86, simplified, ethers v6 form)
 for (const rpcUrl of rpcUrls) {
-    const candidate = new ethers.providers.JsonRpcProvider(rpcUrl);
+    const candidate = new ethers.JsonRpcProvider(rpcUrl);
     const candidateTx = await candidate.getTransaction(txHash);
     if (!candidateTx) { continue; }
     tx = candidateTx; provider = candidate; break;
@@ -28,7 +29,8 @@ Notice this tries every configured RPC URL for the chain in order, not just the 
 Step three is the one that ties this function back to a specific prepared deployment, not just any successful contract creation:
 
 ```ts
-const actualCalldataHash = ethers.utils.keccak256(tx.data ?? '0x');
+// src/components/blockchain-deployment/services/deployment-verification.service.ts (lines 103 to 107)
+const actualCalldataHash = ethers.keccak256(tx.data ?? '0x');
 if (actualCalldataHash.toLowerCase() !== expectedCalldataHash.toLowerCase()) {
     return { valid: false, reason: 'Transaction calldata does not match what was prepared for this deployment.' };
 }
@@ -52,7 +54,8 @@ if (!receipt.contractAddress) {
 Step six confirms the transaction's sender is someone this specific user is actually allowed to deploy from:
 
 ```ts
-const senderAddress = ethers.utils.getAddress(tx.from);
+// src/components/blockchain-deployment/services/deployment-verification.service.ts (lines 140 to 155, simplified)
+const senderAddress = ethers.getAddress(tx.from);
 const registeredWallet = await this.walletRepo.findWithWalletAddrssAndUserId(senderAddress, userId);
 if (!registeredWallet) {
     return { valid: false, reason: 'The transaction sender is not a wallet registered to your account.' };
@@ -80,3 +83,17 @@ The function's own doc comment ends with an honest disclosure of a gap it does n
 ## Where to go next
 
 [06-alchemy-and-the-alchmey-folder.md](06-alchemy-and-the-alchmey-folder.md) moves from writing and verifying transactions to a different kind of blockchain reading, answering "what does this wallet already own," through a third party data provider rather than a direct RPC connection.
+
+## Update from the October 2026 uat pull
+
+The logic of the seven checks did not change at all in this pull, but every ethers call inside them was rewritten by commit `71fd2fec` ("Ether versoin 6") for the ethers v5 to v6 upgrade, and the excerpts above have been corrected in place to match. The full diff for `src/components/blockchain-deployment/services/deployment-verification.service.ts` is seven lines. Lines 67 and 68 changed the variable types from `ethers.providers.JsonRpcProvider` and `ethers.providers.TransactionResponse` to `ethers.JsonRpcProvider` and `ethers.TransactionResponse`. Line 71 changed `new ethers.providers.JsonRpcProvider(rpcUrl)` to `new ethers.JsonRpcProvider(rpcUrl)`. Line 103 changed `ethers.utils.keccak256` to `ethers.keccak256`. Line 110 changed `ethers.providers.TransactionReceipt` to `ethers.TransactionReceipt`. Line 142 changed `ethers.utils.getAddress` to `ethers.getAddress`. Line 158 changed `ethers.providers.Block` to `ethers.Block`. Those are pure renames, v6 simply removed the `utils` and `providers` namespaces and exported everything at the top level, so the hashing, the checksum normalisation and the receipt shape behave identically. `receipt.status` is still a plain number (`1` for success, `0` for revert, typed `number | null` in v6) and `block.timestamp` is still a plain number of seconds, so `receipt.status !== 1` at line 125 and `block.timestamp * 1000` at line 166 needed no change and do not mix `bigint` with `number`.
+
+The pull also added the first real test file for this service, `src/components/blockchain-deployment/services/deployment-verification.service.spec.ts` (251 lines, 17 tests). It replaces `ethers.JsonRpcProvider` with a `jest.fn()` through `jest.mock('ethers', ...)` at lines 5 to 14, overrides `ethers.keccak256` in a `beforeEach` at line 67 so the calldata check is controlled by the test rather than by real bytes, and builds fake provider objects with `makeProvider()` at lines 40 to 46. There is one test per failure path of each of the seven steps (unsupported chain, missing RPC, transaction not found, fetch failing on every RPC, missing `preparedCalldataHash`, calldata mismatch, receipt fetch failure, pending receipt, reverted status, no contract address, unparseable sender, unregistered sender, block fetch failure, stale block), one happy path test, a failover test at lines 210 to 234 proving the second RPC is used once the first rejects, and a `block.timestamp` arithmetic test at lines 238 to 250. Be honest with yourself about that last one: the mock itself returns a number, so asserting that the timestamp is a number proves the arithmetic does not throw, but it cannot prove what a real v6 provider returns. The real guarantee comes from the ethers v6 type definitions, not from this test.
+
+Two v6 specific risks are worth writing down, because neither is covered by those tests.
+
+The first is the provider construction at line 71. In v6 a `JsonRpcProvider` built without a network hint detects the chain lazily, and when the node is unreachable it logs "JsonRpcProvider failed to detect network and cannot start up; retry in 1s" and keeps retrying in the background. The marketplace v2 code in this same repository explicitly guards against this by passing `{ staticNetwork: true }` and a chain id, and its comment at `src/components/marketplacev2/order/order.service.ts` lines 154 to 159 states the consequence plainly, "without it, a down/unreachable RPC makes the provider retry network detection every second forever." This service does not pass that option. The concrete scenario: `POL_DEPLOY_RPC` points at a dead host, a user confirms a deployment, and instead of the first candidate failing quickly so the loop moves on to `POL_GM_RPC` (the whole point of the failover written at lines 70 to 86), the request may stall until the HTTP layer gives up, and a new retrying provider object is left behind for every confirm attempt. Because the tests mock `JsonRpcProvider` entirely, this path is never exercised. The fix is a one line change to `new ethers.JsonRpcProvider(rpcUrl, Number(chainConfig.chainId), { staticNetwork: true })` and is worth confirming against a dead URL locally.
+
+The second is that v6 types `provider.getBlock()` as returning `Block | null`. This repository's `tsconfig.json` does not enable `strict` or `strictNullChecks`, so `let block: ethers.Block` at line 158 compiles even though the real return type allows `null`. If a load balanced RPC answers the receipt call from one node and the block call from a node that has not yet seen that block, `getBlock` resolves to `null`, the `try` at lines 159 to 164 does not catch anything because nothing threw, and `block.timestamp` at line 166 throws `TypeError: Cannot read properties of null`, which escapes the function and turns into a 500 response instead of a clean `{ valid: false }`. The same pattern exists in the GM verifier, covered in [../08-affiliate-and-loyalty/04-gm-daily-checkin-and-streaks.md](../08-affiliate-and-loyalty/04-gm-daily-checkin-and-streaks.md). A one line `if (!block) return { valid: false, reason: 'Failed to fetch block details for transaction.' };` would close it.
+
+For how the newer marketplace v2 code reads the chain with a single long lived provider and a retry predicate, see [../12-marketplace-v2/08-the-onchain-event-poller-architecture.md](../12-marketplace-v2/08-the-onchain-event-poller-architecture.md), and for the codebase wide migration story see [../12-marketplace-v2/12-ethers-v6-migration-and-the-new-test-suite.md](../12-marketplace-v2/12-ethers-v6-migration-and-the-new-test-suite.md).

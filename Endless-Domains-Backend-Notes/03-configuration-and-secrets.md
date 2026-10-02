@@ -41,3 +41,60 @@ This class does one thing, given a secret's name (its `SecretId` inside AWS Secr
 ## The practical lesson for you specifically
 
 If you ever need to add a new third party integration to this app (a new payment provider, a new blockchain RPC endpoint, anything needing an API key), the correct move is never to add it to a local `.env` file and call it done, it is to get that key added to the real AWS secret bundle this app fetches from (a conversation with whoever manages the team's AWS account, not a code change), and then read it in code exactly the way every existing module does, through `SecretsService.getSecret(process.env.AWS_MANAGER)` or through `ConfigService.get(...)` once it has been loaded in by `app.module.ts`'s `ConfigModule.forRoot`. Never hardcode a real key directly into a source file, and if you ever find one already hardcoded somewhere while exploring this codebase, that is worth flagging to a senior engineer immediately, not fixing silently, since rotating a leaked key is a coordinated action, not a solo one.
+
+## Update from the October 2026 uat pull
+
+Between commit `a131b429` and `uat` merge commit `dc1ba3e8`, the AWS secret bundle this app depends on grew by more than twenty keys, almost all for the new marketplace. The way they are read is a good, concrete example of everything this note explains.
+
+### The question this note asked you to check, answered
+
+The section on the Joi schema above asks you to find out whether `envValidationSchema` is actually wired into `ConfigModule.forRoot`. It is not. In `src/app.module.ts` the relevant lines are commented out:
+
+```ts
+// src/app.module.ts
+        ConfigModule.forRoot({
+            isGlobal: true,
+            load: [async () => {
+                const secretsService = new SecretsService();
+                const secrets = await secretsService.getSecret(process.env.AWS_MANAGER);
+                return {
+                    ...secrets,
+                };
+            }]
+            // envFilePath: '.env',
+            // validationSchema: envValidationSchema
+        }),
+```
+
+So the Joi schema in `src/app-env-validation.ts` provides no protection at startup today, and none of the new marketplace keys were added to it anyway. Marketplace v2 handles this differently, and better. It brings its own validated loader, which is worth reading as the model for how config validation should look.
+
+### Marketplace v2's own validated config loader
+
+`src/components/marketplacev2/config/chain-config.loader.ts` fetches the same `AWS_MANAGER` secret through `SecretsService`, picks out its own keys, runs each one through a small validator (`chain-config.validators.ts`: `validateChecksumAddress` normalizes every address through `ethers.getAddress` and rejects anything invalid, `validateRpcUrl` only requires that `new URL(value)` parses, so any scheme is accepted, and it deliberately never echoes the value because RPC URLs usually contain an API key, `validateFeeBps` requires an integer from 1 to 10000, and `validateStartBlock` requires a positive integer), and throws a `ChainConfigError` (from `chain-config.errors.ts`) naming the bad key if anything is wrong. The result is assembled into a typed `ChainConfig` object and provided through an injection token, so no other code in the marketplace ever calls `ConfigService.get('SOME_STRING')` directly. That is three improvements over the older pattern in one place: validation runs, the error names the key, and consumers get a typed object instead of `string | undefined`. The cost, covered in the root architecture note, is that a bad marketplace key now stops the entire API from booting. Full detail is in [clusters/12-marketplace-v2/01-what-marketplace-v2-is-and-the-module-map.md](clusters/12-marketplace-v2/01-what-marketplace-v2-is-and-the-module-map.md).
+
+### Every new key, with the names the code actually reads
+
+| Key in the AWS secret | Required | What it is |
+|---|---|---|
+| `POL_RPC_URL` | yes | Polygon JSON RPC endpoint used by order validation, the poller and the expiry sweep |
+| `SEAPORT_ADDRESS_POLYGON` | yes | the Seaport contract that fills orders |
+| `USDT_ADDRESS_POLYGON` | yes | the payment token every v2 order is priced in |
+| `DOMAIN_NFT_ADDRESS_POLYGON_UD` | yes | the domain NFT collection that can be listed (Unstoppable Domains on Polygon) |
+| `FEE_RECIPIENT` | yes | the address that receives the marketplace fee |
+| `FEE_BPS` | yes | the marketplace fee in basis points, an integer from 1 to 10000 |
+| `POLLER_START_BLOCK_POLYGON` | no | first block the poller reads; falls back to 93,840,000 with only a console warning |
+| `POLLER_ENABLED` | no | turns the poller and expiry sweep on; falls back to `NODE_ENV === 'production'` |
+| `MARKET_DATA_ENABLED` | no | turns the OpenSea jobs on; read on every tick, but the secret is cached forever, so a change in practice needs a restart |
+| `OPENSEA_API_KEY` | when market data is on | sent as the `x-api-key` header; boot fails if the flag is on and this is missing |
+| `COINGECKO_API_KEY` | no | sent as `x-cg-demo-api-key` for USD prices |
+| `MARKET_ENS_ETH_BASE_REGISTRAR_CONTRACT`, `MARKET_ENS_ETH_NAME_WRAPPER_CONTRACT`, `MARKET_UD_POL_CONTRACT`, `MARKET_UD_BASE_CONTRACT`, `MARKET_SPACEID_BNB_CONTRACT`, `MARKET_SPACEID_ARB_CONTRACT`, `MARKET_FREENAME_POL_CONTRACT`, `MARKET_FREENAME_BNB_CONTRACT`, `MARKET_FREENAME_BASE_CONTRACT`, `MARKET_UD_ETH_CONTRACT` | per collection, the last one optional | the collections OpenSea stats are pulled for; a missing one only drops that collection |
+
+The chain id, 137 for Polygon, is a hardcoded constant rather than a key.
+
+### The `.env.sample` trap
+
+`.env.sample` gained a commented block for these keys in this update, and it is wrong in three ways that would cost a new developer an afternoon. It uses different names (`POLYGON_RPC_URL`, `SEAPORT_ADDRESS`, `USDT_ADDRESS`, `DOMAIN_NFT_ADDRESS`) from the ones the code reads. It leaves out the two `POLLER_*` keys. And it shows a `FEE_BPS` of zero, which the validator rejects. Its own comment does say, correctly, that these values are not read from `process.env` and must go into the `AWS_MANAGER` secret. The same file still shows `JWT_ACCESS_TOKEN_EXPIRATION=3d`, while a comment in `require-verified-wallet.guard.ts` records that the real secret serves `1h`. The general lesson from this note holds even more strongly now: a sample file is documentation, and documentation drifts. The loader code is the truth.
+
+### Caching of secrets now matters at runtime
+
+This note mentioned that `SecretsService` caches the bundle for the life of the process. That used to be only a startup detail. Now several values behave like runtime switches, `MARKET_DATA_ENABLED` above all, and their code reads them "every tick". Because the bundle is cached forever, flipping the value in AWS still does nothing until the process restarts. The region is also still hardcoded to `us-east-1` inside `SecretsService`.

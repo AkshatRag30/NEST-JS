@@ -71,7 +71,7 @@ constructor(
 }
 ```
 
-Inside `AuthService` itself, both secrets are read the "correct" way for this codebase, through `ConfigService.get(...)`, which as covered in [03-configuration-and-secrets.md](../../03-configuration-and-secrets.md) is populated at boot from the AWS Secrets Manager bundle named by `AWS_MANAGER`, not from a local `.env` file. `getTokens` then signs both tokens with `jwtService.signAsync`, one with `JWT_ACCESS_TOKEN_SECRET` and `JWT_ACCESS_TOKEN_EXPIRATION`, one with `JWT_REFRESH_TOKEN_SECRET` and `JWT_REFRESH_TOKEN_EXPIRATION`, both durations themselves also pulled from `ConfigService`. The payload signed into both tokens is intentionally minimal, `{ userId: userId }`, nothing else, meaning a route handler that needs the user's role or other attributes has to look the user up again rather than trusting anything embedded in the token.
+Inside `AuthService` itself, both secrets are read the "correct" way for this codebase, through `ConfigService.get(...)`, which as covered in [03-configuration-and-secrets.md](../../03-configuration-and-secrets.md) is populated at boot from the AWS Secrets Manager bundle named by `AWS_MANAGER`, not from a local `.env` file. `getTokens` then signs both tokens with `jwtService.signAsync`, one with `JWT_ACCESS_TOKEN_SECRET` and `JWT_ACCESS_TOKEN_EXPIRATION`, one with `JWT_REFRESH_TOKEN_SECRET` and `JWT_REFRESH_TOKEN_EXPIRATION`, both durations themselves also pulled from `ConfigService`. The payload signed into both tokens is intentionally minimal, `{ userId: userId }`, meaning a route handler that needs the user's role or other attributes has to look the user up again rather than trusting anything embedded in the token. Since the October 2026 `uat` pull, `getTokens` also accepts an optional `VerifiedWalletInfo` and, only when one is passed, adds two more claims, `walletAddress` and `walletVerifiedAt`, to both tokens. Password login and registration never pass it, so their tokens are still exactly `{ userId }`, see the update section at the end of this note.
 
 Where this gets inconsistent is in how the token is later verified, not signed. `access-token.strategy.ts`, the Passport strategy `AccessTokenGuard` actually delegates to, reads the same secret a different way:
 
@@ -107,18 +107,19 @@ The refresh token strategy correctly fetches its secret from `SecretsService` as
 ## Refreshing tokens, and the two different hashing algorithms in play
 
 ```ts
-async refreshTokens(userId: string, refreshToken: string): Promise<TokenResponseDto> {
+// src/components/auth/auth.service.ts (current uat version, third parameter added in the October 2026 pull)
+async refreshTokens(userId: string, refreshToken: string, verifiedWalletInfo?: VerifiedWalletInfo): Promise<TokenResponseDto> {
     const refreshTokenFromDB = await this.userService.getHashedRefreshTokenByUserId(userId);
     if (!refreshTokenFromDB) throw new UnauthorizedException('Access Denied');
     const refreshTokenMatches = await verifyHash(refreshTokenFromDB, refreshToken);
     if (!refreshTokenMatches) throw new UnauthorizedException('Access Denied');
-    const tokens = await this.getTokens(userId);
+    const tokens = await this.getTokens(userId, verifiedWalletInfo);
     await this.userService.setCurrentRefreshToken(tokens.refreshToken, userId);
     return new TokenResponseDto(tokens.accessToken, tokens.refreshToken);
 }
 ```
 
-`GET /auth/refresh-token` is protected by `RefreshTokenGuard`, which is just `AuthGuard('jwt-refresh')`, meaning the refresh token itself has to arrive as a bearer token in the `Authorization` header and pass the `RefreshTokenStrategy`'s `validate()` before this method is even called, `validate()` there reads the raw token back off the request (`req.get('Authorization').replace('Bearer', '').trim()`) and attaches it to `req.user.refreshToken` so the controller can hand it to `refreshTokens` alongside the userId decoded from the token's own payload.
+`GET /auth/refresh-token` is protected by `RefreshTokenGuard`, which is just `AuthGuard('jwt-refresh')`, meaning the refresh token itself has to arrive as a bearer token in the `Authorization` header and pass the `RefreshTokenStrategy`'s `validate()` before this method is even called, `validate()` there reads the raw token back off the request (`req.get('Authorization').replace('Bearer', '').trim()`) and attaches it to `req.user.refreshToken` so the controller can hand it to `refreshTokens` alongside the userId decoded from the token's own payload (and, since the October 2026 pull, any `walletAddress` and `walletVerifiedAt` claims the refresh token carries, which are forwarded unchanged).
 
 The refresh token itself is never stored in the database in plaintext. `setCurrentRefreshToken`, over in `user.service.ts`, hashes it before saving:
 
@@ -198,3 +199,15 @@ async updateDomainDetialTable(payload: UpdateDomainDetailTableAfterLoginEvent): 
 ```
 
 This is why `AuthModule` imports so many blockchain data provider modules despite being, on paper, an authentication module. Every successful login kicks off a background refresh of whatever domains the logging in user's connected wallets actually hold on chain, across five different providers (Unstoppable Domains, ENS, Arbitrum, Binance Smart Chain, and a Base variant of Unstoppable Domains, plus Freename), so that the rest of the application always has reasonably fresh data without the user having to manually refresh anything. It runs asynchronously (`{ async: true }`), so a slow or failing call to any of these five providers never delays or fails the login response itself, it only affects how fresh the user's domain listing looks afterward.
+
+## Update from the October 2026 uat pull
+
+Between the baseline commit `a131b429` (9 September 2026) and the `uat` head `dc1ba3e8` (2 October 2026), the B02 "JWT wallet" work for marketplace v2 (branch `feat/t49-b02-jwt-wallet`, pull request #944, plus later commits) changed this module in small but important ways. Nothing about password login, registration, logout, or the password reset flows changed. What changed is the token payload and the refresh path.
+
+`JwtPayload` in `src/components/auth/interface/jwt-payload.interface.ts` gained two optional claims, `walletAddress?: string` and `walletVerifiedAt?: number` (milliseconds since the epoch, not seconds), and a new `VerifiedWalletInfo` interface holds the same pair with both fields required. `AuthService.getTokens(userId, verifiedWalletInfo?)` spreads those claims into the payload of both the access and refresh tokens only when a proof is passed, so every existing caller, including `register` and `login` above, still mints exactly `{ userId }`. The only callers that pass a proof are `Web3AuthService.authenticate` (wallet login) and the new marketplace v2 `WalletVerificationService.proveWallet`.
+
+`GET /auth/refresh-token` now reads `walletAddress` and `walletVerifiedAt` off the decoded refresh token (`auth.controller.ts`, lines 47 to 49) and, when both are present and the timestamp is a number, passes them to `refreshTokens(userId, refreshToken, verifiedWalletInfo)`, which forwards them to `getTokens`. The timestamp is copied, not reset, so a refresh never extends how long a wallet counts as verified. `RefreshTokenValidateResponseDto` gained the two optional fields to match, and `AuthServiceInterface` gained the optional parameters on `refreshTokens` and `getTokens`.
+
+A new `src/components/auth/auth.service.spec.ts` (the first spec for this service) has five tests: missing stored hash throws `UnauthorizedException`, mismatched hash throws, a refresh with no wallet info signs exactly `{ userId: 'user-1' }`, a refresh with wallet info signs the claims into both tokens, and the original `walletVerifiedAt` is preserved rather than bumped. It builds `AuthService` with thirteen positional constructor arguments, which is brittle.
+
+One gap to know about: the separate legacy route `POST /web3-auth/refresh-token` (in `web3-auth.service.ts:329`) still calls `refreshTokens` with only two arguments, so refreshing through it drops the wallet claims. The full story, including the guard that consumes these claims, is in [the wallet verification note](../12-marketplace-v2/02-wallet-verification-and-the-verified-wallet-guard.md), and the wider marketplace v2 context is in [the module map note](../12-marketplace-v2/01-what-marketplace-v2-is-and-the-module-map.md).

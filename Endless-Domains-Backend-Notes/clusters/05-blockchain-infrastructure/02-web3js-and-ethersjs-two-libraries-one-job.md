@@ -2,7 +2,7 @@
 
 ## Why both are in the same `package.json`
 
-Looking at the dependency list, this backend carries `web3` and `web3-utils` at version `^1.10.0`, and `ethers` at version `^5.7.2`, alongside `@ethersproject/bignumber` and `@ethersproject/bytes` (smaller companion packages that ship as part of the ethers.js family). Both `web3.js` and `ethers.js` exist to solve the exact same underlying problem, letting a JavaScript program talk to an EVM compatible blockchain, whether that is reading data off it or sending a signed transaction to it. They are, in a real sense, competitors, most projects pick one and use it everywhere. This codebase did not, and reading through it, a clear pattern emerges for why.
+Looking at the dependency list, this backend carries `web3` and `web3-utils` at version `^1.10.0`, and `ethers` at version `^6.13.4` (it was `^5.7.2` until commit `71fd2fec`, see the update at the end of this note), and the code also imports `@ethersproject/bignumber` and `@ethersproject/bytes` (smaller companion packages from the ethers v5 family). Be careful with that last pair, they are not actually listed in `package.json` at all, in the v5 era they arrived as dependencies of `ethers` itself, and today they only arrive because `alchemy-sdk` depends on them (`package-lock.json` lines 8713 to 8722), which the update section below explains. Both `web3.js` and `ethers.js` exist to solve the exact same underlying problem, letting a JavaScript program talk to an EVM compatible blockchain, whether that is reading data off it or sending a signed transaction to it. They are, in a real sense, competitors, most projects pick one and use it everywhere. This codebase did not, and reading through it, a clear pattern emerges for why.
 
 ## The pattern this codebase actually follows
 
@@ -30,19 +30,22 @@ async checkDomainAvailability(domainName: string): Promise<boolean> {
 Now look at `contract-deployment.service.ts`, which needs to actually build something to be signed, not just read a value:
 
 ```ts
+// src/components/contract-deployment/services/contract-deployment.service.ts (lines 61 to 68, ethers v6 form as of uat)
 import { ethers } from 'ethers';
 ...
-const iface = new ethers.utils.Interface(OZ_ERC20_CONSTRUCTOR_ABI);
+const supplyWei = ethers.parseUnits(dto.supply, OZ_ERC20_DECIMALS);
+
+const iface = new ethers.Interface(OZ_ERC20_CONSTRUCTOR_ABI);
 const encodedArgs = iface.encodeDeploy([dto.name, dto.symbol, supplyWei, ownerAddress]);
 const data = OZ_ERC20_BYTECODE + encodedArgs.slice(2);
 
 const gasEstimate = await this.estimateGas(chainConfig, data, signerAddress);
-const preparedCalldataHash = ethers.utils.keccak256(data);
+const preparedCalldataHash = ethers.keccak256(data);
 ```
 
-`ethers.utils.Interface` is built purely from the constructor's ABI fragment, and `encodeDeploy` turns a plain JavaScript array of arguments, a name, a symbol, a supply, an owner address, into the exact ABI encoded byte sequence a contract constructor expects to receive. Concatenating that onto the front of the compiled bytecode (after stripping ethers' own leading `0x` from the encoded args with `.slice(2)`, since the bytecode already supplies one) produces the complete `data` field of an unsigned contract creation transaction, precisely the mechanic described in file 01. `ethers.utils.keccak256` then hashes that exact payload, a fingerprint this company stores and later checks against, covered fully in file 05.
+(Until commit `71fd2fec` these lines read `ethers.utils.parseUnits`, `new ethers.utils.Interface` and `ethers.utils.keccak256`, the ethers v5 spellings; the update section at the bottom of this note explains the move.) `ethers.Interface` is built purely from the constructor's ABI fragment, and `encodeDeploy` turns a plain JavaScript array of arguments, a name, a symbol, a supply, an owner address, into the exact ABI encoded byte sequence a contract constructor expects to receive. Concatenating that onto the front of the compiled bytecode (after stripping ethers' own leading `0x` from the encoded args with `.slice(2)`, since the bytecode already supplies one) produces the complete `data` field of an unsigned contract creation transaction, precisely the mechanic described in file 01. `ethers.keccak256` then hashes that exact payload, a fingerprint this company stores and later checks against, covered fully in file 05.
 
-`ethers.providers.JsonRpcProvider` shows up the same way in `estimateGas` and throughout `deployment-verification.service.ts`, wrapping a plain RPC URL fetched from AWS Secrets Manager, then calling methods like `provider.estimateGas(...)`, `provider.getTransaction(txHash)`, `provider.getTransactionReceipt(txHash)`, and `provider.getBlock(blockNumber)`, none of which need a private key, they are still reads, just reads phrased in ethers' API rather than web3.js's, because the rest of that file's logic (encoding, hashing) is already written against ethers.
+`ethers.JsonRpcProvider` (spelled `ethers.providers.JsonRpcProvider` in the v5 era) shows up the same way in `estimateGas` and throughout `deployment-verification.service.ts`, wrapping a plain RPC URL fetched from AWS Secrets Manager, then calling methods like `provider.estimateGas(...)`, `provider.getTransaction(txHash)`, `provider.getTransactionReceipt(txHash)`, and `provider.getBlock(blockNumber)`, none of which need a private key, they are still reads, just reads phrased in ethers' API rather than web3.js's, because the rest of that file's logic (encoding, hashing) is already written against ethers.
 
 ## Why the split makes sense rather than being an accident
 
@@ -55,3 +58,24 @@ Notice that in every single example above, across both libraries, this backend i
 ## Where to go next
 
 [03-solidity-contracts-and-the-compile-pipeline.md](03-solidity-contracts-and-the-compile-pipeline.md) shows exactly how the `OZ_ERC20_BYTECODE` and `OZ_ERC721_BYTECODE` constants referenced above actually come into existence, the one time, by hand, build step that turns the Solidity source into those strings.
+
+## Update from the October 2026 uat pull
+
+The biggest change to this note's subject is that `ethers` itself moved a whole major version. Commit `71fd2fec` ("Ether versoin 6", 11 September 2026) changed `package.json` from `"ethers": "^5.7.2"` to `"ethers": "^6.13.4"`, and `package-lock.json` now resolves it to `6.17.0`. Commit `26b1f0e4` ("Upgraded the ethers version", 14 September 2026) then finished the job in the renewal and ENS modules. `web3` stayed at `^1.10.0`, so the "web3.js reads, ethers writes" split described above still holds, it just means the ethers half of the codebase now speaks a different dialect. The full, codebase wide story, including a translation table and the new tests that pin the behaviour, lives in [../12-marketplace-v2/12-ethers-v6-migration-and-the-new-test-suite.md](../12-marketplace-v2/12-ethers-v6-migration-and-the-new-test-suite.md). Here is what matters for the files this note quotes.
+
+The single most visible change is that ethers v6 deleted the `ethers.utils` and `ethers.providers` namespaces. Everything that used to hang off them is now a top level export. So `ethers.utils.Interface` became `ethers.Interface`, `ethers.utils.keccak256` became `ethers.keccak256`, `ethers.utils.parseUnits` became `ethers.parseUnits`, `ethers.utils.getAddress` became `ethers.getAddress`, `ethers.utils.id` became `ethers.id`, `ethers.utils.namehash` became `ethers.namehash`, and `ethers.providers.JsonRpcProvider` became `ethers.JsonRpcProvider`. The type names moved the same way, `ethers.providers.TransactionResponse` is now `ethers.TransactionResponse`, `ethers.providers.TransactionReceipt` is now `ethers.TransactionReceipt`, `ethers.providers.Block` is now `ethers.Block`, and `ethers.utils.LogDescription` is now `ethers.LogDescription`. The algorithms behind these functions did not change at all, keccak256 is still keccak256 and ABI encoding is still ABI encoding, which is why the new golden hash tests in `contract-deployment.service.spec.ts` line 109 and `nft-collection.service.spec.ts` line 119 can pin exact outputs.
+
+The second change is about numbers. In v5 every big on chain integer came back as a `BigNumber` object with methods like `.toNumber()`, `.isZero()` and `.eq()`. In v6 they come back as native JavaScript `bigint` values, the same type you get from writing `42n`. That is why `estimateGas` in both deployment services changed like this:
+
+```ts
+// src/components/contract-deployment/services/contract-deployment.service.ts (lines 278 to 280)
+const provider = new ethers.JsonRpcProvider(rpcUrl);
+const estimate = await provider.estimateGas({ data, from: fromAddress });
+return Number(estimate);
+```
+
+In v5 the last line was `return estimate.toNumber();`. A `bigint` has no `.toNumber()` method, so leaving the old line in place would have thrown `TypeError: estimate.toNumber is not a function` at runtime, which the surrounding `catch` would have silently converted into `DEFAULT_GAS_ESTIMATE_FALLBACK` on every single request. That is a nasty kind of failure because nothing visibly breaks, every user just gets the fallback gas number forever. The same file shape exists at `src/components/nft-collection/services/nft-collection.service.ts` lines 313 to 315. `Number()` is safe here because a gas estimate is always far below `Number.MAX_SAFE_INTEGER`.
+
+A frontend developer should also know the one place where the old v5 library is still alive on purpose. `src/components/alchmey/arbAlchmey/arb-alchmey.servers.ts` line 11 still imports `BigNumber` from `@ethersproject/bignumber`, and `src/components/alchmey/fetch-expiry/fetch-expiry.service.ts` line 11 and `src/components/ud-integration/ud-integration.service.ts` line 27 still import `arrayify` from `@ethersproject/bytes`. These are the standalone v5 packages, not the `ethers` package, so the major version bump did not touch them, and the new specs `arb-alchmey.servers.spec.ts` and `keccak256-cross-agreement.spec.ts` exist precisely to prove that. The honest risk is that neither package is declared in `package.json`. Before the upgrade they were pulled in by `ethers@5` itself, and now they are only present because `alchemy-sdk` happens to depend on `@ethersproject/*` at `^5.7.0`. If `alchemy-sdk` is ever upgraded to a release that drops those dependencies, or npm stops hoisting them to the top of `node_modules`, the imports at those three lines will fail at boot with "Cannot find module". The fix is a one line addition of both packages to `dependencies`.
+
+The last behavioural difference worth carrying in your head is how a v6 `JsonRpcProvider` treats an unreachable node. When it cannot detect the network on first use, v6 logs "JsonRpcProvider failed to detect network and cannot start up; retry in 1s" and keeps retrying in the background every second, rather than failing the call quickly the way v5 tended to. The newer marketplace v2 code knows this and passes `{ staticNetwork: true }` with an explicit chain id, with the comment at `src/components/marketplacev2/order/order.service.ts` lines 154 to 159 saying exactly why. None of the older services this cluster covers do that. `deployment-verification.service.ts` line 71, `contract-deployment.service.ts` line 278, `nft-collection.service.ts` line 313, `gm-verification.service.ts` line 178 and the four providers built in `recent-domain.service.ts` lines 53 to 57 all call `new ethers.JsonRpcProvider(url)` with no network hint. The concrete failure scenario is a misconfigured or dead RPC URL in Secrets Manager: instead of a quick "Failed to fetch transaction from chain" response, the request can hang until the HTTP layer gives up, and the log fills with the retry message once a second for every provider object created. File 05 of this cluster walks through what that means for the deployment verification fallback loop specifically.

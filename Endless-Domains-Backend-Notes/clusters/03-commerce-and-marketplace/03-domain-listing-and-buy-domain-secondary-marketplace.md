@@ -29,14 +29,21 @@ A row here does not represent "a listing the backend created," it represents "a 
 Two details worth calling out. First, `assertNonZeroListingId`, called at the very top of both `create` and `createBulk` before anything else happens:
 
 ```ts
-// src/components/marketplace/abi/listing-id.util.ts
+// src/components/marketplace/abi/listing-id.util.ts (lines 7 to 17, native bigint since commit 71fd2fec)
 export function assertNonZeroListingId(listingId: string): void {
-  const value = BigNumber.from(listingId);
-  if (value.isZero()) throw new BadRequestException('listingId 0 is not a valid listing');
+  let value: bigint;
+  try {
+    value = BigInt(listingId);
+  } catch {
+    throw new BadRequestException('Invalid listingId');
+  }
+  if (value === 0n) {
+    throw new BadRequestException('listingId 0 is not a valid listing');
+  }
 }
 ```
 
-The comment above it explains why this exists, the marketplace contract's own `tokenToListing` mapping defaults any uninitialized entry to `0`, so a `listingId` of `0` can never legitimately refer to a real listing, only to a bug or a spoofed request, and this guard rejects it before a single database write happens. Second, duplicate active listings are blocked at the application layer, not the schema, `create` looks up any existing row for the same `domainName` with `status: 'Active'` and throws a different message depending on whether the caller already owns that active listing or someone else does, a small but real UX distinction a frontend error message should preserve.
+(Before the ethers v6 upgrade this used `BigNumber.from(listingId)` and `value.isZero()` from ethers v5; the update section at the end of this note explains the switch to plain JavaScript `BigInt`.) The comment above it explains why this exists, the marketplace contract's own `tokenToListing` mapping defaults any uninitialized entry to `0`, so a `listingId` of `0` can never legitimately refer to a real listing, only to a bug or a spoofed request, and this guard rejects it before a single database write happens. Second, duplicate active listings are blocked at the application layer, not the schema, `create` looks up any existing row for the same `domainName` with `status: 'Active'` and throws a different message depending on whether the caller already owns that active listing or someone else does, a small but real UX distinction a frontend error message should preserve.
 
 Bulk listing (`createBulk`) is the same idea for many domains at once under one shared `blockchainTxHash` and a generated `bulkGroupId`, which matters later because the reconciliation cron and the success email logic both key off `bulkGroupId` to send exactly one "your domains are listed" email per batch rather than one per domain.
 
@@ -74,6 +81,7 @@ What is not protected is the second half. The reservation and the `buyDomainRepo
 `marketplace/abi/marketplace-event-decoder.ts` is worth reading directly, because it is the piece that keeps this whole on chain flow honest. Anyone could, in principle, call `POST /marketplace/buy-domain` with any `price` and `buyer` they like, that is just an HTTP body. What actually confirms a sale happened is `verifyNewSaleEvent`, run later by the cron against the real transaction receipt pulled straight off the blockchain node:
 
 ```ts
+// src/components/marketplace/abi/marketplace-event-decoder.ts (lines 63 to 84, condensed; `event` is typed ethers.LogDescription since the v6 upgrade)
 export function verifyNewSaleEvent(event, expected: ExpectedSale): SaleVerificationResult {
   if (!event || event.name !== 'NewSale') return { matches: false, reason: 'NewSale event not found in transaction logs' };
   if (event.args.listingId.toString() !== expected.listingId) return { matches: false, reason: 'listingId mismatch' };
@@ -89,3 +97,44 @@ Every field the API request claimed, listing, token, buyer, price, gets checked 
 ## Frontend note
 
 If you have built a UI for an NFT marketplace or any peer to peer resale flow before, this should feel familiar in shape, list an item, someone else buys it, both sides wait for a blockchain confirmation before anything is final. What is worth taking away as a backend lesson is the layered trust model, the API accepts a claim eagerly (so the UI can show "purchase pending" immediately) but nothing is marked final until an independent, un-spoofable source (the chain itself) has verified every detail of that claim, and the one place that discipline slips, the plain, un-transacted gap between reserving a listing and recording the buy, is exactly the kind of subtle bug this pattern is supposed to protect against elsewhere.
+
+## Update from the October 2026 uat pull
+
+Two files this note quotes were rewritten in commit `71fd2fec` ("Ether versoin 6", 11 September 2026) as part of moving the whole backend from ethers v5 to ethers v6, and both excerpts above have been corrected in place. The listing and buying business logic did not change, and the reservation gap described above is still open. It is also worth knowing up front that this whole secondary marketplace now has a successor being built next to it, `src/components/marketplacev2`, based on the Seaport protocol rather than the custom `NFTDomainsMarketplaceV5` contract. The v1 code in this note is still registered and still running, but new marketplace work is happening in v2, described starting at [../12-marketplace-v2/01-what-marketplace-v2-is-and-the-module-map.md](../12-marketplace-v2/01-what-marketplace-v2-is-and-the-module-map.md), with its order model in [../12-marketplace-v2/03-seaport-primer-and-the-order-entity.md](../12-marketplace-v2/03-seaport-primer-and-the-order-entity.md).
+
+### `assertNonZeroListingId` no longer uses an ethers type at all
+
+The old version imported `BigNumber` from `ethers` and called `BigNumber.from(listingId)` and `value.isZero()`. ethers v6 removed `BigNumber` entirely in favour of the native JavaScript `bigint`, so the new version at `src/components/marketplace/abi/listing-id.util.ts` lines 7 to 17 drops the ethers import and uses `BigInt(listingId)` and `value === 0n` instead. Two reasons this is the right shape. First, a listing id is a `uint256` on chain and can be far larger than `Number.MAX_SAFE_INTEGER` (9007199254740991), and `bigint` represents any integer exactly, while `Number('99999999999999999999')` silently rounds. Second, `BigInt(...)` throws a `SyntaxError` for anything that is not an integer string (`'abc'`, `'1.5'`), which the `try`/`catch` turns into a clean `400 Invalid listingId`.
+
+There is one small behavioural difference worth knowing. `BigInt('')` and `BigInt('   ')` do not throw, they return `0n`, whereas v5's `BigNumber.from('')` threw "invalid BigNumber string". So an empty `listingId` used to fail with "Invalid listingId" and now fails with "listingId 0 is not a valid listing". It is still a 400 and still rejected before any database write, so nothing unsafe gets through, but a frontend that matched on the exact message text would see a different string. `BigInt` also accepts `0b` and `0o` prefixed strings, which `BigNumber.from` did not, a harmless widening. The existing spec `listing-id.util.spec.ts` (which already carried Sprint 04 test case U4.6) gained a fifth test asserting that `'99999999999999999999'` does not throw, documenting exactly why `BigInt` rather than `Number` was chosen.
+
+### The event decoder and the `parseLog` null trap
+
+`src/components/marketplace/abi/marketplace-event-decoder.ts` had every type renamed (`ethers.utils.Interface` to `ethers.Interface` at line 4, `ethers.utils.LogDescription` to `ethers.LogDescription` at lines 15, 16, 36, 64 and 94), but the change that actually matters is this one:
+
+```ts
+// src/components/marketplace/abi/marketplace-event-decoder.ts (lines 15 to 31)
+export function decodeMarketplaceLogs(logs: RawLog[]): ethers.LogDescription[] {
+  const decoded: ethers.LogDescription[] = [];
+  for (const log of logs || []) {
+    try {
+      // ethers v6's Interface.parseLog returns null for a non-matching topic instead of
+      // throwing (v5 threw here) — must be filtered explicitly, or a null slips into the
+      // decoded array and callers like findMarketplaceEvent would throw when reading .name.
+      const parsed = marketplaceInterface.parseLog(log);
+      if (parsed) {
+        decoded.push(parsed);
+      }
+    } catch {
+      continue;
+    }
+  }
+  return decoded;
+}
+```
+
+A real transaction receipt for a marketplace sale contains logs from several contracts, the marketplace itself plus the NFT contract's `Transfer` and possibly token contracts. In v5, `parseLog` on a foreign log threw, the `catch` skipped it, and only marketplace events were collected. In v6 the same call quietly returns `null` instead. Without the new `if (parsed)` guard, every foreign log would have pushed a `null` into `decoded`, and `findMarketplaceEvent`'s `.find((event) => event.name === eventName)` at line 37 would then crash with `TypeError: Cannot read properties of null (reading 'name')` on the first foreign log it reached, which in `transaction-cron/cron.service.ts` line 403 would have stopped every buy confirmation dead. This is the single most important behavioural catch in the whole migration for this cluster. The `catch` is still needed, because v6 still throws for a log whose topic matches but whose data cannot be decoded.
+
+`normalizeUsdPrice` at lines 41 to 43 now takes a `bigint` instead of a `BigNumber` and calls `ethers.formatUnits(priceInUSD, USD_PRICE_DECIMALS)`, the v6 spelling of `ethers.utils.formatUnits`. It still returns a plain JavaScript number through `parseFloat`, so `usdAmountsMatch` keeps comparing two numbers with a one cent tolerance, and nothing `bigint` ever reaches a JSON response from this file. The comparisons inside `verifyNewSaleEvent` and `verifyListingAddedEvent` use `event.args.listingId.toString()` and `event.args.tokenId.toString()` against the stored strings, and `bigint.toString()` gives the same decimal string `BigNumber.toString()` did, so those checks are unchanged in behaviour. Notice that the receipts fed into this decoder still come from web3.js (`web3.eth.getTransactionReceipt` at `cron.service.ts` line 398), so this is a case of ethers v6 decoding logs that web3 v1 fetched, which works because both use the same plain `{ topics, data }` log shape.
+
+The spec `marketplace-event-decoder.spec.ts` (15 tests, covering Sprint 04 test cases U4.1 to U4.7) was rewritten to build its fixture logs with v6: `ethers.BigNumber.from('42')` became the literal `42n`, `ethers.utils.parseUnits('123.45', 6)` became `ethers.parseUnits('123.45', 6)`, and `ethers.utils.keccak256(ethers.utils.toUtf8Bytes(...))` became `ethers.keccak256(ethers.toUtf8Bytes(...))`. Its existing test "ignores logs that are not one of the known marketplace events" now doubles as the regression test for the `parseLog` null change above, since a random topic now goes through the `null` branch instead of the `catch`. A related v6 fix outside this cluster, `findByTokenId` on the domain detail repository gaining a `registryAddress` scope, is used only by marketplace v2 and is covered in [../04-domain-core-product/01-domain-entities-what-a-domain-actually-is.md](../04-domain-core-product/01-domain-entities-what-a-domain-actually-is.md). The codebase wide migration story is in [../12-marketplace-v2/12-ethers-v6-migration-and-the-new-test-suite.md](../12-marketplace-v2/12-ethers-v6-migration-and-the-new-test-suite.md).

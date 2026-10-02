@@ -28,3 +28,21 @@ This matters more than it might look like at first. A plain string log like `"or
 ## Where this actually gets used
 
 `LoggerModule` exports `CustomLoggerService` for any feature module to inject, and the specific `logOrderEvent`, `logDomainEvent`, and `logWebhookEvent` calls are worth watching for once you reach the commerce, domain, and webhook cluster notes, they mark the exact points in the code someone already decided were important enough to leave a durable, structured trail for, which is often a faster way to find the truly critical logic in a large, unfamiliar codebase than reading every file start to finish, follow the logging calls, and you will usually land on the code that actually matters most to the business.
+
+## Update from the October 2026 uat pull
+
+One small change landed in `CustomLoggerService` between `a131b429` and `dc1ba3e8`, and it matters far more than its size suggests, because the new marketplace leans on `warn()` heavily.
+
+```ts
+// src/logger/file-logge.ts
+    warn(message: string) {
+        this.logger.warn({ context: this.context, message });
+        console.log(new Date().toISOString(), this.context, message, 'warn')
+    }
+```
+
+`warn()` now also prints to the console, which makes warnings visible in a local terminal and in the container's stdout. The history behind that line is worth knowing. A CloudWatch transport for the warn level was added in commit `96f221ec` and removed again in `bdd8e80a`. So on `uat` today, `warn` messages reach the console only. They go to neither the error log group (which keeps only `error`) nor the info log group (which filters to exactly `info`). `debug()` goes nowhere at all outside the console.
+
+That matters because a lot of important marketplace v2 signals are logged at `warn` or `debug`. These include a failed `getLogs` call in the poller, the alert that fires when an order the backend believed was cancelled was sold on chain anyway, Seaport `CounterIncremented` events (which silently invalidate a seller's orders), every fallback warning from the chain config loader (which uses `console.warn` directly), and the many "missing contract key" warnings from the market data config. Unless someone is reading raw container output, none of these will be seen in CloudWatch. If you are ever asked why an alert never fired, check the log level first.
+
+Two smaller observations for the curious. `filterOnlyLevel` near the top of the file is declared `async`, so it returns a Promise to Winston's `format` rather than the log entry itself, which is worth testing before you trust that filter. And the logger sets up its CloudWatch transports asynchronously, while the new poller calls `debug()` from its constructor during boot, which is a latent race the poller notes describe in [clusters/12-marketplace-v2/08-the-onchain-event-poller-architecture.md](clusters/12-marketplace-v2/08-the-onchain-event-poller-architecture.md).
